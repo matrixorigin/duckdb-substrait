@@ -1,0 +1,157 @@
+# name: test/sql/test_from_substrait_anti_join.test
+# description: Test importing Substrait left and right anti joins
+# group: [sql]
+
+require substrait
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE anti_left (k INTEGER)
+
+statement ok
+INSERT INTO anti_left VALUES (1), (2), (2), (NULL)
+
+statement ok
+CREATE TABLE anti_right (k INTEGER)
+
+statement ok
+INSERT INTO anti_right VALUES (2), (3), (3), (NULL)
+
+# Duplicates on the matched side do not duplicate output, and NULL does not
+# compare equal to NULL.
+query I
+CALL from_substrait_json('
+{
+  "version": {"minorNumber": 48, "producer": "MatrixOne"},
+  "extensionUrns": [{"extensionUrnAnchor": 1, "urn": "extension:io.substrait:functions_comparison"}],
+  "extensions": [{"extensionFunction": {"extensionUrnReference": 1, "functionAnchor": 1, "name": "equal"}}],
+  "relations": [{
+    "root": {
+      "input": {
+        "sort": {
+          "input": {
+            "join": {
+              "left": {
+                "read": {
+                  "baseSchema": {
+                    "names": ["k"],
+                    "struct": {
+                      "types": [{"i32": {"nullability": "NULLABILITY_NULLABLE"}}],
+                      "nullability": "NULLABILITY_REQUIRED"
+                    }
+                  },
+                  "namedTable": {"names": ["anti_left"]}
+                }
+              },
+              "right": {
+                "read": {
+                  "baseSchema": {
+                    "names": ["k"],
+                    "struct": {
+                      "types": [{"i32": {"nullability": "NULLABILITY_NULLABLE"}}],
+                      "nullability": "NULLABILITY_REQUIRED"
+                    }
+                  },
+                  "namedTable": {"names": ["anti_right"]}
+                }
+              },
+              "expression": {
+                "scalarFunction": {
+                  "functionReference": 1,
+                  "arguments": [
+                    {"value": {"selection": {"directReference": {"structField": {}}, "rootReference": {}}}},
+                    {"value": {"selection": {"directReference": {"structField": {"field": 1}}, "rootReference": {}}}}
+                  ],
+                  "outputType": {"bool": {"nullability": "NULLABILITY_NULLABLE"}}
+                }
+              },
+              "type": "JOIN_TYPE_LEFT_ANTI"
+            }
+          },
+          "sorts": [{
+            "expr": {"selection": {"directReference": {"structField": {}}, "rootReference": {}}},
+            "direction": "SORT_DIRECTION_ASC_NULLS_LAST"
+          }]
+        }
+      },
+      "names": ["k"]
+    }
+  }]
+}')
+----
+1
+NULL
+
+# A right anti join retains the right input, including its duplicate unmatched
+# rows, while discarding the matched key.
+query I
+CALL from_substrait_json('
+{
+  "version": {"minorNumber": 48, "producer": "MatrixOne"},
+  "extensionUrns": [{"extensionUrnAnchor": 1, "urn": "extension:io.substrait:functions_comparison"}],
+  "extensions": [{"extensionFunction": {"extensionUrnReference": 1, "functionAnchor": 1, "name": "equal"}}],
+  "relations": [{
+    "root": {
+      "input": {
+        "sort": {
+          "input": {
+            "join": {
+              "left": {
+                "read": {
+                  "baseSchema": {
+                    "names": ["k"],
+                    "struct": {
+                      "types": [{"i32": {"nullability": "NULLABILITY_NULLABLE"}}],
+                      "nullability": "NULLABILITY_REQUIRED"
+                    }
+                  },
+                  "namedTable": {"names": ["anti_left"]}
+                }
+              },
+              "right": {
+                "read": {
+                  "baseSchema": {
+                    "names": ["k"],
+                    "struct": {
+                      "types": [{"i32": {"nullability": "NULLABILITY_NULLABLE"}}],
+                      "nullability": "NULLABILITY_REQUIRED"
+                    }
+                  },
+                  "namedTable": {"names": ["anti_right"]}
+                }
+              },
+              "expression": {
+                "scalarFunction": {
+                  "functionReference": 1,
+                  "arguments": [
+                    {"value": {"selection": {"directReference": {"structField": {}}, "rootReference": {}}}},
+                    {"value": {"selection": {"directReference": {"structField": {"field": 1}}, "rootReference": {}}}}
+                  ],
+                  "outputType": {"bool": {"nullability": "NULLABILITY_NULLABLE"}}
+                }
+              },
+              "type": "JOIN_TYPE_RIGHT_ANTI"
+            }
+          },
+          "sorts": [{
+            "expr": {"selection": {"directReference": {"structField": {}}, "rootReference": {}}},
+            "direction": "SORT_DIRECTION_ASC_NULLS_LAST"
+          }]
+        }
+      },
+      "names": ["k"]
+    }
+  }]
+}')
+----
+3
+3
+NULL
+
+statement ok
+DROP TABLE anti_left
+
+statement ok
+DROP TABLE anti_right
