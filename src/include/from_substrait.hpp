@@ -16,6 +16,30 @@
 
 namespace duckdb {
 
+struct SubstraitExtensionIdentity {
+	uint32_t anchor;
+	string urn;
+	string name;
+};
+
+// Opt-in, converter-owned import policy. No global registrations or numeric
+// semantics live here: the embedding consumer owns its extension contract.
+class SubstraitExtensionHandler {
+public:
+	virtual ~SubstraitExtensionHandler() = default;
+	virtual bool Handles(const SubstraitExtensionIdentity &identity) const = 0;
+	virtual LogicalType Type(ClientContext &context, const SubstraitExtensionIdentity &identity,
+	                         const substrait::Type &type) const;
+	virtual unique_ptr<ParsedExpression> Literal(ClientContext &context, const SubstraitExtensionIdentity &identity,
+	                                             const substrait::Expression_Literal &literal) const;
+	virtual unique_ptr<ParsedExpression> Scalar(ClientContext &context, const SubstraitExtensionIdentity &identity,
+	                                            const substrait::Expression_ScalarFunction &function,
+	                                            vector<unique_ptr<ParsedExpression>> children) const;
+	virtual unique_ptr<ParsedExpression> Aggregate(ClientContext &context, const SubstraitExtensionIdentity &identity,
+	                                               const substrait::AggregateFunction &function,
+	                                               vector<unique_ptr<ParsedExpression>> children) const;
+};
+
 struct RootNameIterator {
 	explicit RootNameIterator(const google::protobuf::RepeatedPtrField<std::string> *names) : names(names) {};
 	string GetCurrentName() const {
@@ -56,6 +80,8 @@ class SubstraitToDuckDB {
 public:
 	SubstraitToDuckDB(shared_ptr<ClientContext> &context_p, const string &serialized, bool json = false,
 	                  bool acquire_lock = false);
+	SubstraitToDuckDB(shared_ptr<ClientContext> &context_p, const string &serialized, bool json, bool acquire_lock,
+	                  shared_ptr<SubstraitExtensionHandler> extensions);
 	//! Transforms Substrait Plan to DuckDB Relation
 	shared_ptr<Relation> TransformPlan();
 
@@ -88,7 +114,7 @@ private:
 	//! Transform Substrait Expressions to DuckDB Expressions
 	unique_ptr<ParsedExpression> TransformExpr(const substrait::Expression &sexpr,
 	                                           RootNameIterator *iterator = nullptr);
-	static unique_ptr<ParsedExpression> TransformLiteralExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformLiteralExpr(const substrait::Expression &sexpr);
 	static unique_ptr<ParsedExpression> TransformSelectionExpr(const substrait::Expression &sexpr);
 	unique_ptr<ParsedExpression> TransformScalarFunctionExpr(const substrait::Expression &sexpr);
 	unique_ptr<ParsedExpression> TransformIfThenExpr(const substrait::Expression &sexpr);
@@ -100,7 +126,9 @@ private:
 	static void VerifyCorrectExtractSubfield(const string &subfield);
 	static string RemapFunctionName(const string &function_name);
 	static string RemoveExtension(const string &function_name);
-	static LogicalType SubstraitToDuckType(const substrait::Type &s_type);
+	LogicalType SubstraitToDuckType(const substrait::Type &s_type);
+	SubstraitExtensionIdentity ExtensionIdentity(uint32_t anchor, bool type) const;
+	bool HandlesFunction(uint32_t anchor) const;
 	//! Looks up for aggregation function in functions_map
 	string FindFunction(uint64_t id);
 
@@ -114,6 +142,9 @@ private:
 	substrait::Plan plan;
 	//! Variable used to register functions
 	unordered_map<uint64_t, string> functions_map;
+	shared_ptr<SubstraitExtensionHandler> extension_handler;
+	unordered_map<uint32_t, SubstraitExtensionIdentity> extension_types;
+	unordered_map<uint32_t, SubstraitExtensionIdentity> extension_functions;
 	//! Remapped functions with differing names to the correct DuckDB functions
 	//! names
 	static const unordered_map<std::string, std::string> function_names_remap;

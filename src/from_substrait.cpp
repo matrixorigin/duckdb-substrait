@@ -42,6 +42,39 @@
 #include "duckdb/main/relation/setop_relation.hpp"
 
 namespace duckdb {
+LogicalType SubstraitExtensionHandler::Type(ClientContext &, const SubstraitExtensionIdentity &,
+                                            const substrait::Type &) const {
+	throw NotImplementedException("extension type is not handled");
+}
+unique_ptr<ParsedExpression> SubstraitExtensionHandler::Literal(ClientContext &, const SubstraitExtensionIdentity &,
+                                                                const substrait::Expression_Literal &) const {
+	throw NotImplementedException("extension literal is not handled");
+}
+unique_ptr<ParsedExpression> SubstraitExtensionHandler::Scalar(ClientContext &, const SubstraitExtensionIdentity &,
+                                                               const substrait::Expression_ScalarFunction &,
+                                                               vector<unique_ptr<ParsedExpression>>) const {
+	throw NotImplementedException("extension scalar is not handled");
+}
+unique_ptr<ParsedExpression> SubstraitExtensionHandler::Aggregate(ClientContext &, const SubstraitExtensionIdentity &,
+                                                                  const substrait::AggregateFunction &,
+                                                                  vector<unique_ptr<ParsedExpression>>) const {
+	throw NotImplementedException("extension aggregate is not handled");
+}
+
+SubstraitExtensionIdentity SubstraitToDuckDB::ExtensionIdentity(uint32_t anchor, bool type) const {
+	auto &entries = type ? extension_types : extension_functions;
+	auto found = entries.find(anchor);
+	if (found == entries.end()) {
+		throw InvalidInputException("undeclared extension anchor");
+	}
+	return found->second;
+}
+bool SubstraitToDuckDB::HandlesFunction(uint32_t anchor) const {
+	if (!extension_handler) {
+		return false;
+	}
+	return extension_handler->Handles(ExtensionIdentity(anchor, false));
+}
 const std::unordered_map<std::string, std::string> SubstraitToDuckDB::function_names_remap = {
     {"modulus", "mod"},      {"std_dev", "stddev"},     {"starts_with", "prefix"},
     {"ends_with", "suffix"}, {"substring", "substr"},   {"char_length", "length"},
@@ -83,7 +116,12 @@ string SubstraitToDuckDB::RemoveExtension(const string &function_name) {
 
 SubstraitToDuckDB::SubstraitToDuckDB(shared_ptr<ClientContext> &context_p, const string &serialized, bool json,
                                      bool acquire_lock_p)
-    : context(context_p), acquire_lock(acquire_lock_p) {
+    : SubstraitToDuckDB(context_p, serialized, json, acquire_lock_p, nullptr) {
+}
+
+SubstraitToDuckDB::SubstraitToDuckDB(shared_ptr<ClientContext> &context_p, const string &serialized, bool json,
+                                     bool acquire_lock_p, shared_ptr<SubstraitExtensionHandler> extensions)
+    : context(context_p), extension_handler(std::move(extensions)), acquire_lock(acquire_lock_p) {
 	if (!json) {
 		if (!plan.ParseFromString(serialized)) {
 			throw std::runtime_error("Was not possible to convert binary into Substrait plan");
@@ -100,6 +138,35 @@ SubstraitToDuckDB::SubstraitToDuckDB(shared_ptr<ClientContext> &context_p, const
 			continue;
 		}
 		functions_map[sext.extension_function().function_anchor()] = sext.extension_function().name();
+	}
+	if (extension_handler) {
+		unordered_map<uint32_t, string> urns;
+		for (auto &urn : plan.extension_urns()) {
+			if (!urns.emplace(urn.extension_urn_anchor(), urn.urn()).second) {
+				throw InvalidInputException("duplicate extension URN anchor");
+			}
+		}
+		for (auto &entry : plan.extensions()) {
+			bool type = entry.has_extension_type();
+			if (!type && !entry.has_extension_function()) {
+				continue;
+			}
+			auto anchor = type ? entry.extension_type().type_anchor() : entry.extension_function().function_anchor();
+			auto reference = type ? entry.extension_type().extension_urn_reference()
+			                      : entry.extension_function().extension_urn_reference();
+			auto name = type ? entry.extension_type().name() : entry.extension_function().name();
+			auto urn = urns.find(reference);
+			// Legacy standard-function plans omit URNs. Keep that path intact;
+			// user-defined types always need an explicitly resolved identity.
+			if (urn == urns.end() && (type || reference != 0)) {
+				throw InvalidInputException("undeclared extension URN reference");
+			}
+			SubstraitExtensionIdentity identity {anchor, urn == urns.end() ? string() : urn->second, name};
+			auto &entries = type ? extension_types : extension_functions;
+			if (!entries.emplace(anchor, std::move(identity)).second) {
+				throw InvalidInputException("duplicate extension declaration anchor");
+			}
+		}
 	}
 }
 
@@ -195,6 +262,24 @@ Value TransformLiteralToValue(const substrait::Expression_Literal &literal) {
 }
 
 unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformLiteralExpr(const substrait::Expression &sexpr) {
+	if (extension_handler && sexpr.literal().has_null() && sexpr.literal().null().has_user_defined()) {
+		return make_uniq<ConstantExpression>(Value(SubstraitToDuckType(sexpr.literal().null())));
+	}
+	if (sexpr.literal().has_user_defined()) {
+		auto &literal = sexpr.literal().user_defined();
+		if (!extension_handler || !literal.has_type_reference()) {
+			throw NotImplementedException("user-defined literal requires an extension handler and type reference");
+		}
+		auto identity = ExtensionIdentity(literal.type_reference(), true);
+		if (!extension_handler->Handles(identity)) {
+			throw NotImplementedException("user-defined literal extension is not handled");
+		}
+		auto result = extension_handler->Literal(*context, identity, sexpr.literal());
+		if (!result) {
+			throw InvalidInputException("extension literal handler returned no expression");
+		}
+		return result;
+	}
 	return make_uniq<ConstantExpression>(TransformLiteralToValue(sexpr.literal()));
 }
 
@@ -210,6 +295,21 @@ void SubstraitToDuckDB::VerifyCorrectExtractSubfield(const string &subfield) {
 }
 
 unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformScalarFunctionExpr(const substrait::Expression &sexpr) {
+	if (HandlesFunction(sexpr.scalar_function().function_reference())) {
+		vector<unique_ptr<ParsedExpression>> children;
+		for (auto &argument : sexpr.scalar_function().arguments()) {
+			if (argument.has_value()) {
+				children.push_back(TransformExpr(argument.value()));
+			}
+		}
+		auto result =
+		    extension_handler->Scalar(*context, ExtensionIdentity(sexpr.scalar_function().function_reference(), false),
+		                              sexpr.scalar_function(), std::move(children));
+		if (!result) {
+			throw InvalidInputException("extension scalar handler returned no expression");
+		}
+		return result;
+	}
 	auto function_name = FindFunction(sexpr.scalar_function().function_reference());
 	function_name = RemoveExtension(function_name);
 	vector<unique_ptr<ParsedExpression>> children;
@@ -323,6 +423,16 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformIfThenExpr(const substr
 
 LogicalType SubstraitToDuckDB::SubstraitToDuckType(const substrait::Type &s_type) {
 	switch (s_type.kind_case()) {
+	case substrait::Type::KindCase::kUserDefined: {
+		if (!extension_handler) {
+			throw NotImplementedException("user-defined type requires an extension handler");
+		}
+		auto identity = ExtensionIdentity(s_type.user_defined().type_reference(), true);
+		if (!extension_handler->Handles(identity)) {
+			throw NotImplementedException("user-defined type extension is not handled");
+		}
+		return extension_handler->Type(*context, identity, s_type);
+	}
 	case substrait::Type::KindCase::kBool:
 		return {LogicalTypeId::BOOLEAN};
 	case substrait::Type::KindCase::kI8:
@@ -745,6 +855,21 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformAggregateOp(const substrait::Re
 	for (auto &smeas : sop.aggregate().measures()) {
 		vector<unique_ptr<ParsedExpression>> children;
 		auto &s_aggr_function = smeas.measure();
+		if (HandlesFunction(s_aggr_function.function_reference())) {
+			for (auto &argument : s_aggr_function.arguments()) {
+				if (argument.has_value()) {
+					children.push_back(TransformExpr(argument.value()));
+				}
+			}
+			auto result =
+			    extension_handler->Aggregate(*context, ExtensionIdentity(s_aggr_function.function_reference(), false),
+			                                 s_aggr_function, std::move(children));
+			if (!result) {
+				throw InvalidInputException("extension aggregate handler returned no expression");
+			}
+			expressions.push_back(std::move(result));
+			continue;
+		}
 		bool is_distinct = s_aggr_function.invocation() ==
 		                   substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
 		auto function_name = FindFunction(s_aggr_function.function_reference());
@@ -866,7 +991,18 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 		scan = rel->Alias(name);
 	} else if (sget.has_virtual_table()) {
 		// We need to handle a virtual table as a LogicalExpressionGet
-		if (!sget.virtual_table().values().empty()) {
+		if (extension_handler && !sget.virtual_table().values().empty()) {
+			// Legacy literal-only virtual tables must use the same handler
+			// boundary as expression literals, not the untyped Value shortcut.
+			google::protobuf::RepeatedPtrField<substrait::Expression_Nested_Struct> rows;
+			for (auto &row : sget.virtual_table().values()) {
+				auto *expressions = rows.Add();
+				for (auto &literal : row.fields()) {
+					expressions->add_fields()->mutable_literal()->CopyFrom(literal);
+				}
+			}
+			scan = GetValuesExpression(rows);
+		} else if (!sget.virtual_table().values().empty()) {
 			auto literal_values = sget.virtual_table().values();
 			vector<vector<Value>> expression_rows;
 			for (auto &row : literal_values) {
@@ -886,7 +1022,8 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 			}
 		} else if (!sget.virtual_table().expressions().empty()) {
 			scan = GetValuesExpression(sget.virtual_table().expressions());
-		} else if (sget.has_base_schema() && sget.base_schema().names_size() > 0 && sget.base_schema().struct_().types_size() > 0) {
+		} else if (sget.has_base_schema() && sget.base_schema().names_size() > 0 &&
+		           sget.base_schema().struct_().types_size() > 0) {
 			// Empty virtual table represents an empty result (EMPTY_RESULT operator)
 			// Extract schema from base_schema
 			vector<string> column_names;

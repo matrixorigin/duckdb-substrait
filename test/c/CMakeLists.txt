@@ -7,8 +7,9 @@ set (CMAKE_CXX_STANDARD 11)
 include_directories(../../duckdb/src/include)
 include_directories(../../duckdb/test/include)
 include_directories(../../duckdb/third_party/catch)
+include_directories(../../duckdb/extension/core_functions/include)
 
-set(ALL_SOURCES test_substrait_c_api.cpp test_substrait_c_utils.cpp test_projection.cpp test_base_schema_projection.cpp)
+set(ALL_SOURCES test_substrait_c_api.cpp test_substrait_c_utils.cpp test_projection.cpp test_base_schema_projection.cpp test_extension_import.cpp)
 
 
 add_library_unity(test_substrait OBJECT ${ALL_SOURCES})
