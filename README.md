@@ -31,6 +31,35 @@ LOAD 'build/release/extension/substrait/substrait.duckdb_extension';
 
 ## Usage
 
+### Embedding-specific type and function imports
+
+C++ consumers can install a `SubstraitExtensionHandler` on one
+`SubstraitToDuckDB` converter. This is an opt-in embedding interface; the
+ordinary SQL import functions and the original constructor remain unchanged.
+
+```cpp
+SubstraitToDuckDB converter(connection.context, plan_bytes, false, false,
+                           extension_handler);
+auto relation = converter.TransformPlan();
+```
+
+The converter owns a shared reference to the handler, with no process-global
+registry. `Handles` selects resolved extension identities. `Type` receives the
+complete user-defined type, including parameters and nullability. `Literal`
+receives the original literal and payload. `Scalar` and `Aggregate` receive
+the complete function message, declared output type and recursively transformed
+value arguments. Function names are not stripped or remapped before these
+callbacks. Non-value argument descriptors remain available in the original
+function message.
+
+The embedding consumer owns type representation, binding and semantic checks;
+the generic importer supplies no numeric coercion or execution implementation.
+Unhandled user-defined types/literals fail explicitly. An installed handler
+also rejects duplicate extension anchors and unknown URN references. Ordinary
+imports without a handler preserve their previous behavior. Rebuild C++
+consumers when updating this importer; this is not a standalone binary-ABI
+stability guarantee.
+
 This extension provides four new functions to DuckDB:
 
 - `get_substrait`: Converts the provided query into a binary Substrait plan
