@@ -1505,9 +1505,8 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformRootOp(const substrait::RelRoot
 			}
 			aliases.push_back(column_names[i++]);
 			auto nested_names = SkipColumnNames(column.GetType(), extension_handler.get());
-			if (nested_names > static_cast<idx_t>(column_names.size()) - i) {
-				throw InvalidInputException("Number of root column names less than flattened column definitions");
-			}
+			// A final STRUCT may omit its nested root names. Only a later
+			// alias read needs this position, and that read is checked above.
 			i += nested_names;
 			expressions.push_back(make_uniq<PositionalReferenceExpression>(id++));
 		}

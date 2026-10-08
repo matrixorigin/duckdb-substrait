@@ -343,6 +343,27 @@ TEST_CASE("Ordinary STRUCT root names retain flattening and reject short names",
 		REQUIRE(StructValue::GetChildren(chunk->GetValue(0, 0))[0].GetValue<int64_t>() == 7);
 		REQUIRE(StructValue::GetChildren(chunk->GetValue(0, 0))[1].GetValue<int64_t>() == 9);
 	}
+	// Existing exporters may provide only the root heading for a final STRUCT.
+	// Its unused trailing cursor position does not require nested names.
+	auto final_struct = plan;
+	auto *final_root = final_struct.mutable_relations(0)->mutable_root();
+	final_root->clear_names();
+	final_root->add_names("only");
+	final_root->mutable_input()
+	    ->mutable_project()
+	    ->mutable_common()
+	    ->mutable_emit()
+	    ->mutable_output_mapping()
+	    ->RemoveLast();
+	for (bool extension : {false, true}) {
+		auto result = Execute(con, final_struct, extension ? make_shared_ptr<OpaqueImportHandler>() : nullptr);
+		REQUIRE_FALSE(result->HasError());
+		REQUIRE((result->names == duckdb::vector<string> {"only"}));
+		auto chunk = result->Fetch();
+		REQUIRE(chunk);
+		REQUIRE(StructValue::GetChildren(chunk->GetValue(0, 0))[0].GetValue<int64_t>() == 7);
+		REQUIRE(StructValue::GetChildren(chunk->GetValue(0, 0))[1].GetValue<int64_t>() == 9);
+	}
 	for (int size : {3, 2, 1}) {
 		while (root->names_size() > size) {
 			root->mutable_names()->RemoveLast();
