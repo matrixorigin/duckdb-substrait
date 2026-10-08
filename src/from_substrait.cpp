@@ -42,6 +42,9 @@
 #include "duckdb/main/relation/setop_relation.hpp"
 
 namespace duckdb {
+bool SubstraitExtensionHandler::IsOpaqueType(const LogicalType &) const {
+	return false;
+}
 LogicalType SubstraitExtensionHandler::Type(ClientContext &, const SubstraitExtensionIdentity &,
                                             const substrait::Type &) const {
 	throw NotImplementedException("extension type is not handled");
@@ -1448,19 +1451,23 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformOp(const substrait::Rel &sop,
 	}
 }
 
-void SkipColumnNamesRecurse(int32_t &columns_to_skip, const LogicalType &type) {
+void SkipColumnNamesRecurse(idx_t &columns_to_skip, const LogicalType &type,
+                            const SubstraitExtensionHandler *extensions) {
+	if (extensions && extensions->IsOpaqueType(type)) {
+		return;
+	}
 	if (type.id() == LogicalTypeId::STRUCT) {
 		idx_t struct_size = StructType::GetChildCount(type);
-		columns_to_skip += static_cast<int32_t>(struct_size);
+		columns_to_skip += struct_size;
 		for (auto &struct_type : StructType::GetChildTypes(type)) {
-			SkipColumnNamesRecurse(columns_to_skip, struct_type.second);
+			SkipColumnNamesRecurse(columns_to_skip, struct_type.second, extensions);
 		}
 	}
 }
 
-int32_t SkipColumnNames(const LogicalType &type) {
-	int32_t columns_to_skip = 0;
-	SkipColumnNamesRecurse(columns_to_skip, type);
+idx_t SkipColumnNames(const LogicalType &type, const SubstraitExtensionHandler *extensions) {
+	idx_t columns_to_skip = 0;
+	SkipColumnNamesRecurse(columns_to_skip, type, extensions);
 	return columns_to_skip;
 }
 
@@ -1488,14 +1495,19 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformRootOp(const substrait::RelRoot
 	auto first_projection_or_table = GetProjection(*child);
 	if (first_projection_or_table) {
 		vector<ColumnDefinition> *column_definitions = &first_projection_or_table->Cast<ProjectionRelation>().columns;
-		int32_t i = 0;
+		idx_t i = 0;
 		if (column_definitions->size() > column_names.size()) {
 			throw InvalidInputException("Number of column names less than number of column definitions");
 		}
 		for (auto &column : *column_definitions) {
+			if (i >= static_cast<idx_t>(column_names.size())) {
+				throw InvalidInputException("Number of root column names less than flattened column definitions");
+			}
 			aliases.push_back(column_names[i++]);
-			auto column_type = column.GetType();
-			i += SkipColumnNames(column.GetType());
+			auto nested_names = SkipColumnNames(column.GetType(), extension_handler.get());
+			// A final STRUCT may omit its nested root names. Only a later
+			// alias read needs this position, and that read is checked above.
+			i += nested_names;
 			expressions.push_back(make_uniq<PositionalReferenceExpression>(id++));
 		}
 	} else {

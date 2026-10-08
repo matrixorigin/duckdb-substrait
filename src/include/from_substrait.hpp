@@ -28,6 +28,10 @@ class SubstraitExtensionHandler {
 public:
 	virtual ~SubstraitExtensionHandler() = default;
 	virtual bool Handles(const SubstraitExtensionIdentity &identity) const = 0;
+	// An opaque extension scalar may use a nested DuckDB carrier. Its private
+	// children do not consume flattened Substrait root column names. Ordinary
+	// STRUCT naming remains the default for handlers that do not opt in.
+	virtual bool IsOpaqueType(const LogicalType &type) const;
 	virtual LogicalType Type(ClientContext &context, const SubstraitExtensionIdentity &identity,
 	                         const substrait::Type &type) const;
 	virtual unique_ptr<ParsedExpression> Literal(ClientContext &context, const SubstraitExtensionIdentity &identity,
@@ -55,6 +59,10 @@ struct RootNameIterator {
 		++iterator;
 	}
 	bool Unique(idx_t count) const {
+		if (!names || iterator < 0 || static_cast<idx_t>(iterator) > static_cast<idx_t>(names->size()) ||
+		    count > static_cast<idx_t>(names->size()) - static_cast<idx_t>(iterator)) {
+			throw InvalidInputException("Trying to access invalid root names at struct creation");
+		}
 		idx_t pos = iterator;
 		set<string> values;
 		for (idx_t i = 0; i < count; i++) {
