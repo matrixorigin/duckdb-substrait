@@ -26,7 +26,7 @@ public:
 		types++;
 		return LogicalType::BIGINT; // test-only carrier, not numeric execution
 	}
-	unique_ptr<ParsedExpression> Literal(ClientContext &, const SubstraitExtensionIdentity &id,
+	duckdb::unique_ptr<ParsedExpression> Literal(ClientContext &, const SubstraitExtensionIdentity &id,
 	                                     const substrait::Expression_Literal &literal) const override {
 		REQUIRE(id.name == "exact");
 		REQUIRE(literal.user_defined().type_parameters_size() == 3);
@@ -35,18 +35,18 @@ public:
 		literals++;
 		return make_uniq<ConstantExpression>(Value::BIGINT(23));
 	}
-	unique_ptr<ParsedExpression> Scalar(ClientContext &, const SubstraitExtensionIdentity &id,
+	duckdb::unique_ptr<ParsedExpression> Scalar(ClientContext &, const SubstraitExtensionIdentity &id,
 	                                    const substrait::Expression_ScalarFunction &fn,
-	                                    vector<unique_ptr<ParsedExpression>> children) const override {
+	                                    duckdb::vector<duckdb::unique_ptr<ParsedExpression>> children) const override {
 		REQUIRE(id.name == "identity:complete-signature");
 		REQUIRE(fn.has_output_type());
 		REQUIRE(children.size() == 1);
 		scalars++;
 		return std::move(children[0]);
 	}
-	unique_ptr<ParsedExpression> Aggregate(ClientContext &, const SubstraitExtensionIdentity &id,
+	duckdb::unique_ptr<ParsedExpression> Aggregate(ClientContext &, const SubstraitExtensionIdentity &id,
 	                                       const substrait::AggregateFunction &fn,
-	                                       vector<unique_ptr<ParsedExpression>> children) const override {
+	                                       duckdb::vector<duckdb::unique_ptr<ParsedExpression>> children) const override {
 		REQUIRE(id.name == "total:complete-signature");
 		REQUIRE(fn.has_output_type());
 		REQUIRE(children.size() == 1);
@@ -90,13 +90,13 @@ void Parameters(Parameterized *type) {
 	}
 }
 
-unique_ptr<QueryResult> Execute(Connection &con, const substrait::Plan &plan,
-                                shared_ptr<SubstraitExtensionHandler> handler) {
+duckdb::unique_ptr<QueryResult> Execute(Connection &con, const substrait::Plan &plan,
+                                       duckdb::shared_ptr<SubstraitExtensionHandler> handler) {
 	SubstraitToDuckDB converter(con.context, plan.SerializeAsString(), false, false, std::move(handler));
 	return converter.TransformPlan()->Execute();
 }
 
-void CheckValue(unique_ptr<QueryResult> result, int64_t expected) {
+void CheckValue(duckdb::unique_ptr<QueryResult> result, int64_t expected) {
 	REQUIRE_FALSE(result->HasError());
 	auto chunk = result->Fetch();
 	REQUIRE(chunk);
