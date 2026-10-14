@@ -334,11 +334,13 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Function Varchar Literal", "[subs
 	                  "direct": {}
 	                },
 	                "virtualTable": {
-	                  "values": [
+	                  "expressions": [
 	                    {
 	                      "fields": [
 	                        {
-	                          "i32": 42
+	                          "literal": {
+	                            "i32": 42
+	                          }
 	                        }
 	                      ]
 	                    }
@@ -410,6 +412,8 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait with Substrait 
 		  "relations" : [ {
 		    "root" : {
 		      "input" : {
+		        "sort" : {
+		          "input" : {
 		        "project" : {
 	              "common": {
 	                "emit": {
@@ -460,6 +464,17 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait with Substrait 
 		            }
 		          } ]
 		        }
+		          },
+		          "sorts" : [ {
+		            "expr" : {
+		              "selection" : {
+		                "directReference" : { "structField" : { } },
+		                "rootReference" : { }
+		              }
+		            },
+		            "direction" : "SORT_DIRECTION_ASC_NULLS_LAST"
+		          } ]
+		        }
 		      },
 		      "names" : [ "fruit", "count" ]
 		    }
@@ -473,8 +488,8 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait with Substrait 
 
 	auto result = FromSubstraitJSON(con,plan_json);
 
-	REQUIRE(CHECK_COLUMN(result, 0, {"cranberry", "apple", "banana"}));
-	REQUIRE(CHECK_COLUMN(result, 1, {3, 1, 2}));
+	REQUIRE(CHECK_COLUMN(result, 0, {"apple", "banana", "cranberry"}));
+	REQUIRE(CHECK_COLUMN(result, 1, {1, 2, 3}));
 }
 
 TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait Snapshot ID with Substrait API", "[substrait-api][iceberg]") {
@@ -491,6 +506,8 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait Snapshot ID wit
 		  "relations" : [ {
 		    "root" : {
 		      "input" : {
+		        "sort" : {
+		          "input" : {
 		        "project" : {
 	              "common": {
 	                "emit": {
@@ -542,6 +559,17 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait Snapshot ID wit
 		            }
 		          } ]
 		        }
+		          },
+		          "sorts" : [ {
+		            "expr" : {
+		              "selection" : {
+		                "directReference" : { "structField" : { } },
+		                "rootReference" : { }
+		              }
+		            },
+		            "direction" : "SORT_DIRECTION_ASC_NULLS_LAST"
+		          } ]
+		        }
 		      },
 		      "names" : [ "fruit", "count" ]
 		    }
@@ -573,6 +601,8 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait Snapshot Timest
 		  "relations" : [ {
 		    "root" : {
 		      "input" : {
+		        "sort" : {
+		          "input" : {
 		        "project" : {
 	              "common": {
 	                "emit": {
@@ -624,6 +654,17 @@ TEST_CASE_METHOD(DataDirectoryFixture, "Test C Iceberg Substrait Snapshot Timest
 		            }
 		          } ]
 		        }
+		          },
+		          "sorts" : [ {
+		            "expr" : {
+		              "selection" : {
+		                "directReference" : { "structField" : { } },
+		                "rootReference" : { }
+		              }
+		            },
+		            "direction" : "SORT_DIRECTION_ASC_NULLS_LAST"
+		          } ]
+		        }
 		      },
 		      "names" : [ "fruit", "count" ]
 		    }
@@ -645,7 +686,7 @@ TEST_CASE("Test C Project SELECT 1", "[substrait-api]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
-	auto expected_json_str = R"({"relations":[{"root":{"input":{"project":{"common":{"emit":{"outputMapping":[1]}},"input":{"read":{"virtualTable":{"values":[{"fields":[{"i32":42}]}]}}},"expressions":[{"literal":{"i32":1}}]}},"names":["1"]}}],"version":{"minorNumber":78,"producer":"DuckDB"}})";
+	auto expected_json_str = R"({"relations":[{"root":{"input":{"project":{"common":{"emit":{"outputMapping":[1]}},"input":{"read":{"virtualTable":{"expressions":[{"fields":[{"literal":{"i32":42}}]}]}}},"expressions":[{"literal":{"i32":1}}]}},"names":["1"]}}],"version":{"minorNumber":102,"producer":"DuckDB"}})";
 	auto json_str = GetSubstraitJSON(con,"SELECT 1");
 	REQUIRE(json_str == expected_json_str);
 	auto result = FromSubstraitJSON(con,json_str);
@@ -676,4 +717,117 @@ TEST_CASE("Test C Project with VirtualTable", "[substrait-api]") {
 	auto json_plan = R"({"version":{"minorNumber":29, "producer":"substrait-go darwin/arm64"}, "relations":[{"root":{"input":{"project":{"common":{"emit":{"outputMapping":[2]}}, "input":{"read":{"common":{"direct":{}}, "baseSchema":{"names":["c1", "c2"], "struct":{"types":[{"fp64":{"nullability":"NULLABILITY_NULLABLE"}}, {"fp64":{"nullability":"NULLABILITY_NULLABLE"}}], "nullability":"NULLABILITY_REQUIRED"}}, "virtualTable":{"expressions":[{"fields":[{"literal":{"fp64":1, "nullable":true}}, {"literal":{"fp64":2, "nullable":true}}]}]}}}, "expressions":[{"literal":{"fp64":42}}]}}, "names":["p1"]}}]})";
 	auto result = FromSubstraitJSON(con,json_plan);
 	REQUIRE(CHECK_COLUMN(result, 0, {42}));
+}
+
+// ============================================================================
+// Tests for deprecated Substrait types in SubstraitToDuckType
+// These verify that the extension handles deprecated type fields without
+// crashing (segfault). See: substrait type.proto fields 14, 29, 17.
+//
+// NOTE: The generated C++ protobuf code excludes deprecated fields entirely,
+// so these tests must use pre-serialized binary protobuf (generated by Python's
+// protobuf library which does support deprecated fields). The plans are minimal:
+// read from a named table + project with a single cast expression.
+// ============================================================================
+
+TEST_CASE("Test cast to deprecated timestamp type", "[substrait-api][deprecated-types]") {
+	// The deprecated "timestamp" type (proto field 14) should map to DuckDB TIMESTAMP.
+	// Previously this caused a segfault because SubstraitToDuckType hit the default
+	// handler which dereferenced a null descriptor pointer (FindFieldByNumber returns
+	// nullptr for fields not in the generated code).
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_test (val VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_test VALUES ('2024-01-15 10:30:00')"));
+
+	// Binary substrait plan: SELECT CAST(val AS TIMESTAMP) FROM cast_test
+	// Generated by Python protobuf which supports the deprecated timestamp field.
+	const unsigned char plan_bytes[] = {0x1a, 0x51, 0x12, 0x4f, 0x0a, 0x45, 0x3a, 0x43,
+	    0x0a, 0x05, 0x12, 0x03, 0x0a, 0x01, 0x01, 0x12, 0x24, 0x0a, 0x22, 0x0a, 0x02,
+	    0x0a, 0x00, 0x12, 0x0f, 0x0a, 0x03, 0x76, 0x61, 0x6c, 0x12, 0x08, 0x0a, 0x04,
+	    0x62, 0x02, 0x10, 0x01, 0x18, 0x02, 0x3a, 0x0b, 0x0a, 0x09, 0x63, 0x61, 0x73,
+	    0x74, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x1a, 0x14, 0x5a, 0x12, 0x0a, 0x04, 0x72,
+	    0x02, 0x10, 0x01, 0x12, 0x08, 0x12, 0x06, 0x0a, 0x02, 0x12, 0x00, 0x22, 0x00,
+	    0x18, 0x01, 0x12, 0x06, 0x72, 0x65, 0x73, 0x75, 0x6c, 0x74, 0x32, 0x02, 0x10,
+	    0x55};
+	string plan_blob(reinterpret_cast<const char *>(plan_bytes), sizeof(plan_bytes));
+
+	auto result = FromSubstrait(con, plan_blob);
+	REQUIRE(CHECK_COLUMN(result, 0, {Value::TIMESTAMP(Timestamp::FromString("2024-01-15 10:30:00", false))}));
+}
+
+TEST_CASE("Test cast to deprecated timestamp_tz type", "[substrait-api][deprecated-types]") {
+	// The deprecated "timestampTz" type (proto field 29) should map to DuckDB TIMESTAMP_TZ.
+	// Same crash mechanism as the timestamp case above.
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_tz_test (val VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_tz_test VALUES ('2024-01-15 10:30:00+00')"));
+
+	// Binary substrait plan: SELECT CAST(val AS TIMESTAMPTZ) FROM cast_tz_test
+	const unsigned char plan_bytes[] = {0x1a, 0x55, 0x12, 0x53, 0x0a, 0x49, 0x3a, 0x47,
+	    0x0a, 0x05, 0x12, 0x03, 0x0a, 0x01, 0x01, 0x12, 0x27, 0x0a, 0x25, 0x0a, 0x02,
+	    0x0a, 0x00, 0x12, 0x0f, 0x0a, 0x03, 0x76, 0x61, 0x6c, 0x12, 0x08, 0x0a, 0x04,
+	    0x62, 0x02, 0x10, 0x01, 0x18, 0x02, 0x3a, 0x0e, 0x0a, 0x0c, 0x63, 0x61, 0x73,
+	    0x74, 0x5f, 0x74, 0x7a, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x1a, 0x15, 0x5a, 0x13,
+	    0x0a, 0x05, 0xea, 0x01, 0x02, 0x10, 0x01, 0x12, 0x08, 0x12, 0x06, 0x0a, 0x02,
+	    0x12, 0x00, 0x22, 0x00, 0x18, 0x01, 0x12, 0x06, 0x72, 0x65, 0x73, 0x75, 0x6c,
+	    0x74, 0x32, 0x02, 0x10, 0x55};
+	string plan_blob(reinterpret_cast<const char *>(plan_bytes), sizeof(plan_bytes));
+
+	auto result = FromSubstrait(con, plan_blob);
+	REQUIRE(CHECK_COLUMN(result, 0, {Value::TIMESTAMPTZ(timestamp_tz_t(Timestamp::FromString("2024-01-15 10:30:00+00", true)))}));
+}
+
+TEST_CASE("Test cast to deprecated time type", "[substrait-api][deprecated-types]") {
+	// The deprecated "time" type (proto field 17) should map to DuckDB TIME.
+	// Same crash mechanism as timestamp/timestamp_tz: the field is excluded from
+	// generated C++ protobuf code, appears in UnknownFieldSet, and previously
+	// caused a segfault via null pointer dereference in the default handler.
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE cast_time_test (val VARCHAR)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO cast_time_test VALUES ('10:30:00')"));
+
+	// Binary substrait plan: SELECT CAST(val AS TIME) FROM cast_time_test
+	// Uses the deprecated "time" type (proto field 17).
+	const unsigned char plan_bytes[] = {0x1a, 0x57, 0x12, 0x55, 0x0a, 0x4b, 0x3a, 0x49,
+	    0x0a, 0x05, 0x12, 0x03, 0x0a, 0x01, 0x01, 0x12, 0x29, 0x0a, 0x27, 0x0a, 0x02,
+	    0x0a, 0x00, 0x12, 0x0f, 0x0a, 0x03, 0x76, 0x61, 0x6c, 0x12, 0x08, 0x0a, 0x04,
+	    0x62, 0x02, 0x10, 0x01, 0x18, 0x02, 0x3a, 0x10, 0x0a, 0x0e, 0x63, 0x61, 0x73,
+	    0x74, 0x5f, 0x74, 0x69, 0x6d, 0x65, 0x5f, 0x74, 0x65, 0x73, 0x74, 0x1a, 0x15,
+	    0x5a, 0x13, 0x0a, 0x05, 0x8a, 0x01, 0x02, 0x10, 0x01, 0x12, 0x08, 0x12, 0x06,
+	    0x0a, 0x02, 0x12, 0x00, 0x22, 0x00, 0x18, 0x01, 0x12, 0x06, 0x72, 0x65, 0x73,
+	    0x75, 0x6c, 0x74, 0x32, 0x02, 0x10, 0x55};
+	string plan_blob(reinterpret_cast<const char *>(plan_bytes), sizeof(plan_bytes));
+
+	auto result = FromSubstrait(con, plan_blob);
+	REQUIRE(CHECK_COLUMN(result, 0, {Value::TIME(10, 30, 0, 0)}));
+}
+
+TEST_CASE("Test extension URN for every any1-expanded overload", "[substrait-api][extension-urn]") {
+	// functions_comparison declares equal(any1, any1). The overload maps expand that placeholder over
+	// every concrete type kind, so one declaration owns many slots, each keyed on a concrete argument
+	// tuple, and every slot carries the declaring extension's URN. The query below binds the i32/i32
+	// slot, which the expansion reaches well after the first one (bool/bool, bool leading GetAllTypes()).
+	//
+	// i32/i32 is only that slot's map key. The name is built from the declared signature, so the JSON
+	// below says `equal:any_any`.
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t1 (a INTEGER, b INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO t1 VALUES (1, 1), (2, 3)"));
+
+	auto json_str = GetSubstraitJSON(con, "SELECT * FROM t1 WHERE a = b");
+	REQUIRE(json_str.find("extension:io.substrait:functions_comparison") != string::npos);
+	// An empty URN is serialized as an anchor with no `urn` field, so that is the shape to exclude.
+	REQUIRE(json_str.find("{\"extensionUrnAnchor\":1}") == string::npos);
+
+	auto result = FromSubstraitJSON(con, json_str);
+	REQUIRE(CHECK_COLUMN(result, 0, {1}));
+	REQUIRE(CHECK_COLUMN(result, 1, {1}));
 }

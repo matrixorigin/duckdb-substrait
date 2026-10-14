@@ -24,8 +24,9 @@
 namespace duckdb {
 class DuckDBToSubstrait {
 public:
-	explicit DuckDBToSubstrait(ClientContext &context, LogicalOperator &dop, bool strict_p)
-	    : context(context), strict(strict_p) {
+	explicit DuckDBToSubstrait(ClientContext &context, LogicalOperator &dop, bool strict_p,
+	                           vector<string> plan_names_p = {})
+	    : context(context), strict(strict_p), plan_names(std::move(plan_names_p)) {
 		TransformPlan(dop);
 	};
 
@@ -63,6 +64,7 @@ private:
 	substrait::Rel *TransformLimit(LogicalOperator &dop);
 	substrait::Rel *TransformOrderBy(LogicalOperator &dop);
 	substrait::Rel *TransformComparisonJoin(LogicalOperator &dop);
+	substrait::Rel *TransformDuplicateEliminatedGet(LogicalOperator &dop);
 	substrait::Rel *TransformAggregateGroup(LogicalOperator &dop);
 	substrait::Rel *TransformWindow(LogicalOperator &dop);
 	substrait::Rel *TransformExpressionGet(LogicalOperator &dop);
@@ -78,6 +80,9 @@ private:
 	substrait::Rel *TransformDeleteTable(LogicalOperator &dop);
 	substrait::Rel *TransformCTERef(LogicalOperator &dop);
 	static vector<LogicalType>::size_type GetColumnCount(LogicalOperator &dop);
+	//! Returns the RelCommon of the concrete relation held by rel, or nullptr for
+	//! relation types that are never produced by this transformer.
+	static substrait::RelCommon *GetRelCommon(substrait::Rel &rel);
 	static substrait::Rel *TransformDummyScan();
 	substrait::Rel *TransformEmptyResult(LogicalOperator &dop);
 	static substrait::RelCommon *CreateOutputMapping(vector<int32_t> vector);
@@ -90,6 +95,7 @@ private:
 
 	//! Methods to transform DuckDBConstants to Substrait Expressions
 	static void TransformConstant(const Value &dval, substrait::Expression &sexpr);
+	static void TransformTinyInt(const Value &dval, substrait::Expression &sexpr);
 	static void TransformInteger(const Value &dval, substrait::Expression &sexpr);
 	static void TransformDouble(const Value &dval, substrait::Expression &sexpr);
 	static void TransformBigInt(const Value &dval, substrait::Expression &sexpr);
@@ -103,6 +109,7 @@ private:
 	static void TransformTime(const Value &dval, substrait::Expression &sexpr);
 	static void TransformInterval(const Value &dval, substrait::Expression &sexpr);
 	static void TransformTimestamp(const Value &dval, substrait::Expression &sexpr);
+	static void TransformTimestampTz(const Value &dval, substrait::Expression &sexpr);
 	static void TransformEnum(const Value &dval, substrait::Expression &sexpr);
 
 	//! Methods to transform a DuckDB Expression to a Substrait Expression
@@ -184,6 +191,23 @@ private:
 		return res;
 	}
 
+	//! State of an enclosing duplicate eliminated join (LOGICAL_DELIM_JOIN) that is needed
+	//! to expand the duplicate eliminated get scans (LOGICAL_DELIM_GET) within it.
+	struct DuplicateEliminationSource {
+		//! The child of the join whose duplicate eliminated column values feed the gets.
+		LogicalOperator *data_side;
+		//! Positions of the duplicate eliminated columns within the data side's output.
+		vector<idx_t> column_indices;
+		//! Plan-unique identifier tying the saved computation hint on the join's data side
+		//! to the loaded computation hints on the copies emitted for its gets.
+		int32_t computation_id;
+	};
+	//! The duplicate eliminated joins enclosing the operator currently being transformed,
+	//! innermost last.
+	vector<DuplicateEliminationSource> duplicate_elimination_sources;
+	//! Last plan-unique computation id handed out for saved/loaded computation hints.
+	int32_t last_computation_id = 0;
+
 	//! Variables used to register functions
 	unordered_map<string, uint64_t> functions_map;
 	unordered_map<string, uint64_t> extension_urn_map;
@@ -203,6 +227,8 @@ private:
 	//! If we are generating a query plan on strict mode we will error if
 	//! things don't go perfectly shiny
 	bool strict;
+	//! Output column names from the planner (fallback when no projection in plan)
+	vector<string> plan_names;
 	string errors;
 };
 } // namespace duckdb

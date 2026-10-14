@@ -1,0 +1,59 @@
+# name: test/sql/test_extension_urn.test
+# description: Verify get_substrait emits well-formed extension URNs (extension:<owner>:<id>) taken verbatim from the extension YAML's urn field
+# group: [sql]
+
+require substrait
+
+statement ok
+CREATE TABLE t (a DOUBLE);
+
+statement ok
+INSERT INTO t VALUES (1), (2), (3);
+
+# Aggregate function: count maps to the functions_aggregate_generic extension.
+# The emitted plan must carry the full Substrait URN exactly as declared by that
+# YAML's `urn` field (extension:io.substrait:functions_aggregate_generic).
+query I
+SELECT count(*) FROM get_substrait_json('SELECT count(*) FROM t') WHERE contains("Json", '"urn":"extension:io.substrait:functions_aggregate_generic"')
+----
+1
+
+# Scalar function: sin maps to the functions_arithmetic extension.
+query I
+SELECT count(*) FROM get_substrait_json('SELECT sin(a) FROM t') WHERE contains("Json", '"urn":"extension:io.substrait:functions_arithmetic"')
+----
+1
+
+# `count` and `sin` above are both registered with concrete argument types, so a single overload is
+# stored and any URN bug affecting later overloads cannot show up. `equal` is declared `any1, any1`
+# and is therefore expanded over every concrete type kind, producing many overloads from one
+# registration -- the case that regressed in #205. Every expanded overload must carry the URN, not
+# just the first one generated.
+query I
+SELECT count(*) FROM get_substrait_json('SELECT a = a FROM t') WHERE contains("Json", '"urn":"extension:io.substrait:functions_comparison"')
+----
+1
+
+# Guard the specific shape the #205 regression produced: an extensionUrns entry carrying an anchor
+# but no `urn` field, which is how an empty URN is serialized.
+query I
+SELECT count(*) FROM get_substrait_json('SELECT a = a FROM t') WHERE contains("Json", '{"extensionUrnAnchor":1}')
+----
+0
+
+# `approx_count_distinct` is declared by two extensions -- returning i64 in
+# functions_aggregate_approx and decimal<38,0> in functions_aggregate_decimal_output -- and the
+# overload maps are keyed on (name, arg_types) with no extension component, so only one of them can
+# be held per key. DuckDB's approx_count_distinct returns BIGINT, so functions_aggregate_approx is
+# the correct attribution.
+query I
+SELECT count(*) FROM get_substrait_json('SELECT approx_count_distinct(a) FROM t') WHERE contains("Json", '"urn":"extension:io.substrait:functions_aggregate_approx"')
+----
+1
+
+# The decimal-output extension is not ingested, so its URN must never appear in an emitted plan.
+# `count` is declared by it as well, and must stay bound to functions_aggregate_generic.
+query I
+SELECT count(*) FROM get_substrait_json('SELECT approx_count_distinct(a), count(a) FROM t') WHERE contains("Json", 'functions_aggregate_decimal_output')
+----
+0

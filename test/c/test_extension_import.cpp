@@ -7,6 +7,7 @@
 #include "duckdb/main/relation.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/config.hpp"
+#include "google/protobuf/unknown_field_set.h"
 
 using namespace duckdb;
 
@@ -226,6 +227,35 @@ TEST_CASE("Query-scoped extension import preserves identities and parameters", "
 		REQUIRE(handler->scalars == 0);
 		REQUIRE(handler->aggregates == 0);
 	}
+	SECTION("legacy literal-only virtual rows retain the extension boundary") {
+		auto plan = BasePlan();
+		auto *read = plan.mutable_relations(0)->mutable_root()->mutable_input()->mutable_read();
+		read->mutable_base_schema()->add_names("seed");
+		read->mutable_base_schema()->mutable_struct_()->add_types()->mutable_i64();
+		auto *table = read->mutable_virtual_table();
+		substrait::Expression_Literal_Struct row;
+		auto *literal = row.add_fields()->mutable_user_defined();
+		literal->set_type_reference(11);
+		Parameters(literal);
+		literal->mutable_value()->set_type_url("urn:test:coefficient");
+		literal->mutable_value()->set_value("coefficient");
+		auto *unknown = table->GetReflection()->MutableUnknownFields(table);
+		unknown->AddLengthDelimited(1, row.SerializeAsString());
+		CheckValue(Execute(con, plan, handler), 23);
+		REQUIRE(handler->literals == 1);
+		REQUIRE_THROWS_AS(Execute(con, plan, nullptr), NotImplementedException);
+
+		row.mutable_fields(0)->set_i64(7);
+		unknown->Clear();
+		unknown->AddLengthDelimited(1, row.SerializeAsString());
+		CheckValue(Execute(con, plan, nullptr), 7);
+		CheckValue(Execute(con, plan, handler), 7);
+		REQUIRE(handler->literals == 1);
+
+		unknown->Clear();
+		unknown->AddLengthDelimited(1, string("\x0a\x80", 2));
+		REQUIRE_THROWS_AS(Execute(con, plan, handler), InvalidInputException);
+	}
 	SECTION("declared but unhandled user type is rejected") {
 		auto plan = BasePlan();
 		plan.mutable_extension_urns(0)->set_urn("urn:other:extension");
@@ -237,6 +267,42 @@ TEST_CASE("Query-scoped extension import preserves identities and parameters", "
 		cast->mutable_type()->mutable_user_defined()->set_type_reference(11);
 		REQUIRE_THROWS_AS(Execute(con, plan, handler), NotImplementedException);
 		REQUIRE(handler->types == 0);
+	}
+	SECTION("legacy integer Fetch modes preserve count and offset") {
+		auto plan = BasePlan();
+		auto *fetch = plan.mutable_relations(0)->mutable_root()->mutable_input()->mutable_fetch();
+		ReadOne(fetch->mutable_input());
+		auto *table = fetch->mutable_input()->mutable_read()->mutable_virtual_table();
+		table->clear_expressions();
+		for (int64_t value : {10, 20, 30}) {
+			table->add_expressions()->add_fields()->mutable_literal()->set_i64(value);
+		}
+		auto *unknown = fetch->GetReflection()->MutableUnknownFields(fetch);
+		unknown->AddVarint(3, 1);
+		unknown->AddVarint(4, 1);
+		CheckValue(Execute(con, plan, handler), 20);
+		CheckValue(Execute(con, plan, nullptr), 20);
+
+		unknown->Clear();
+		unknown->AddVarint(4, 0);
+		auto empty = Execute(con, plan, handler);
+		REQUIRE_FALSE(empty->HasError());
+		auto chunk = empty->Fetch();
+		REQUIRE((!chunk || chunk->size() == 0));
+
+		unknown->Clear();
+		unknown->AddVarint(3, 2);
+		unknown->AddVarint(4, NumericLimits<uint64_t>::Maximum());
+		CheckValue(Execute(con, plan, handler), 30);
+
+		unknown->Clear();
+		unknown->AddVarint(4, 1);
+		fetch->mutable_count_expr()->mutable_literal()->set_i64(1);
+		REQUIRE_THROWS_AS(Execute(con, plan, handler), InvalidInputException);
+		fetch->clear_count_expr();
+		unknown->Clear();
+		unknown->AddVarint(3, NumericLimits<uint64_t>::Maximum());
+		REQUIRE_THROWS_AS(Execute(con, plan, handler), InvalidInputException);
 	}
 }
 
@@ -275,7 +341,7 @@ TEST_CASE("Opaque extension carriers preserve subsequent root names", "[substrai
 		auto input = root->input();
 		root->mutable_input()->Clear();
 		auto *fetch = root->mutable_input()->mutable_fetch();
-		fetch->set_count(1);
+		fetch->mutable_count_expr()->mutable_literal()->set_i64(1);
 		auto *sort = fetch->mutable_input()->mutable_sort();
 		sort->mutable_input()->CopyFrom(input);
 		auto *field = sort->add_sorts();

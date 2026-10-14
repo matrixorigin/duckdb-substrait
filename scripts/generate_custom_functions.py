@@ -1,15 +1,131 @@
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from os import walk
 import yaml
 import regex
 
+# The Substrait extension definitions are consumed from the substrait-extensions
+# C++ package published by substrait-packaging. Bump this tag (in lockstep with
+# the substrait-protobuf GIT_TAG in CMakeLists.txt) to update the Substrait
+# version, then re-run this script and commit the regenerated
+# src/custom_extensions_generated.cpp.
+SUBSTRAIT_PACKAGING_REPO = "https://github.com/substrait-io/substrait-packaging.git"
+SUBSTRAIT_EXTENSIONS_TAG = "cpp/substrait-extensions/v0.102.0"
+SUBSTRAIT_EXTENSIONS_SUBDIR = os.path.join("cpp", "substrait-extensions", "extensions")
+
+# Only ingest extension YAMLs that declare real Substrait functions. Every
+# legitimate function extension follows the `functions_*.yaml` naming
+# convention, so we allowlist by that prefix rather than walking every YAML in
+# the directory. This deliberately skips:
+#   * example/placeholder extensions -- notably `unknown.yaml`, which declares a
+#     custom `unknown` type and defines add/subtract/.../count over it under the
+#     placeholder URN `extension:io.substrait:unknown`. Ingesting it produced
+#     fabricated signatures and a bogus URN that could clobber real
+#     registrations (see issue #214).
+#   * type-only definitions (`extension_types.yaml`, `type_variations.yaml`),
+#     which declare no functions.
+# This mirrors substrait-java, which loads an explicit `functions_*.yaml`
+# allowlist. Type combinations not covered by a real extension then correctly
+# fall back to `native` instead of referencing a fake URN.
+FUNCTION_EXTENSION_PREFIX = "functions_"
+
+# Function extensions this producer deliberately does not ingest, even though they match
+# the allowlist above.
+#
+# functions_aggregate_decimal_output declares `count` and `approx_count_distinct` returning
+# decimal<38,0>, differing from the standard aggregates only in return type. DuckDB's own
+# `count` and `approx_count_distinct` return BIGINT, so it has no overload that these
+# declarations could describe.
+#
+# Ingesting them is worse than redundant: they share (name, arg_types) with the i64
+# declarations in functions_aggregate_generic and functions_aggregate_approx, and the
+# overload maps in SubstraitCustomFunctions are keyed without an extension component, so
+# only one declaration per key can be held. Excluding this file keeps each of those names
+# bound to the extension whose return type DuckDB actually implements.
+#
+# Upstream discussion of whether this extension should exist at all:
+# https://github.com/substrait-io/substrait/issues/1121
+EXCLUDED_FUNCTION_EXTENSIONS = frozenset({"functions_aggregate_decimal_output.yaml"})
+
+
+def is_function_extension(file_name):
+	return file_name.startswith(FUNCTION_EXTENSION_PREFIX) and file_name.endswith(".yaml")
+
+
+def is_excluded_function_extension(file_name):
+	return file_name in EXCLUDED_FUNCTION_EXTENSIONS
+
+
+def declared_type(arg):
+	"""The argument's type as the C++ side receives it, or '' if it carries none.
+
+	The `<...>` parameter block is dropped because the overload maps key on unparameterized
+	type names -- `varchar<L1>` and `varchar<L2>` are one key. An enumeration or type argument
+	declares `options`/`type` instead of `value` and so yields '', which the emitter skips.
+	"""
+	return regex.sub(r'<[^>]*>', '', arg.get('value', ''))
+
+
+# `variadic` keys the C++ side understands. Anything else in the block bounds or qualifies the
+# repetition in a way the producer would silently ignore, which is how a plan ends up naming a
+# call after a signature that does not cover it -- `max` would let an over-long call resolve,
+# and `parameterConsistency: INCONSISTENT` would widen what the repeated argument accepts
+# beyond the single type the lookup keys on.
+SUPPORTED_VARIADIC_KEYS = frozenset({"min"})
+
+
+def validate_variadic_impl(urn, function_name, implementation, args):
+	"""Refuse to generate a variadic registration the C++ side cannot honour faithfully.
+
+	Each of these holds for every variadic impl in the pinned extensions, so this raises only
+	when a future Substrait version introduces a shape that needs real work in
+	SubstraitCustomFunctions. Failing regeneration is the point: the alternative is a
+	registration that resolves calls it should not, which nothing downstream can detect.
+
+	Located by URN rather than by file: when the script clones the pinned tag itself the
+	extensions live under a temp dir that is deleted on the way out, so a path here would name
+	somewhere the reader cannot go. The URN is the extension's identity everywhere else too,
+	and the file it came from follows from the naming convention this script allowlists on.
+	"""
+	where = f"{function_name} in {urn}"
+
+	unsupported = sorted(set(implementation['variadic'] or {}) - SUPPORTED_VARIADIC_KEYS)
+	if unsupported:
+		raise ValueError(
+			f"{where}: variadic declares {unsupported}, which the producer does not implement. "
+			f"Only {sorted(SUPPORTED_VARIADIC_KEYS)} is honoured; teach "
+			f"SubstraitCustomFunctions about the rest before regenerating.")
+
+	# InsertVariadicCustomFunction derives the minimum call-site arity from the number of types
+	# it is handed, so an argument that contributes no type would make that minimum too low.
+	if any(not declared_type(arg) for arg in args):
+		raise ValueError(
+			f"{where}: variadic impl has an argument with no `value` (an enumeration or type "
+			f"argument). Those are dropped from the emitted type list, so the minimum arity "
+			f"computed from it would be short by that many arguments.")
+
+	# A variadic entry is keyed on its repeatable type alone, so the declared arguments have to
+	# be indistinguishable at lookup: a call whose arguments are all of the repeatable type
+	# would otherwise match an impl it does not fit and be named after that impl's signature.
+	# Nullability is normalized away downstream, so it does not count as a difference here.
+	key_types = {declared_type(arg).rstrip('?') for arg in args}
+	if len(key_types) > 1:
+		raise ValueError(
+			f"{where}: variadic impl mixes argument types {sorted(key_types)}. The overload map "
+			f"keys a variadic entry on its final type alone, which cannot distinguish this impl "
+			f"from one taking only the repeatable type.")
 
 
 def parse_function_data(functions,yaml_data,function_type):
+	# parse_yaml has already established that this is a non-empty string.
+	urn = yaml_data['urn']
 	for function_data in yaml_data.get(function_type, []):
 		function = {
 			'name': function_data['name'],
-			'impls_args': []
+			'impls': []
 		}
 
 		for implementation in function_data.get('impls', []):
@@ -18,7 +134,25 @@ def parse_function_data(functions,yaml_data,function_type):
 				arg_info = {'name': arg.get('name', ''), 'value': arg.get('value', '')}
 				args.append(arg_info)
 
-			function['impls_args'].append(args)
+			# `variadic` marks the impl's final argument as repeatable; a trailing `?` on an
+			# argument's value marks it nullable and says nothing about arity. Nothing in the
+			# argument list implies the one from the other, so the flag has to be carried
+			# rather than reconstructed downstream (#253).
+			#
+			# Keyed on the key's presence, not on its value: `variadic: {}` declares an impl
+			# variadic while bounding nothing, and the schema makes every field of the block
+			# optional. `min` counts occurrences of the repeatable argument; absent, it bounds
+			# nothing either, so 0.
+			is_variadic = 'variadic' in implementation
+			variadic = implementation.get('variadic') or {}
+			if is_variadic:
+				validate_variadic_impl(urn, function_data['name'], implementation, args)
+
+			function['impls'].append({
+				'args': args,
+				'is_variadic': is_variadic,
+				'variadic_min': variadic.get('min', 0),
+			})
 
 		functions.append(function)
 	return functions
@@ -26,33 +160,52 @@ def parse_function_data(functions,yaml_data,function_type):
 def parse_yaml(file_path):
 	with open(file_path, 'r') as file:
 		yaml_data = yaml.safe_load(file)
+	# `urn` is a required field in the Substrait simple-extensions schema. Fail loudly rather than
+	# emitting an empty URN, which the producer cannot turn into a resolvable plan.
+	urn = yaml_data['urn']
+	if not isinstance(urn, str) or not urn.strip():
+		raise ValueError(f"{file_path}: 'urn' must be a non-empty string, got {urn!r}")
 	functions = []
 	functions = parse_function_data(functions,yaml_data,'scalar_functions')
 	functions = parse_function_data(functions,yaml_data,'aggregate_functions')
 	functions = parse_function_data(functions,yaml_data,'window_functions')
-	return functions
+	return urn, functions
 
-def get_custom_functions():
+def get_custom_functions(custom_extension_folder):
 	inner_code = ""
 	type_set = set()
-	custom_extension_folder  = os.path.join(os.path.dirname(os.path.realpath(__file__)),'..','substrait','extensions')
 	custom_function_paths = next(walk(custom_extension_folder), (None, None, []))[2]
 	for custom_function_path in custom_function_paths:
-		functions = parse_yaml(os.path.join(custom_extension_folder,custom_function_path))
+		if not is_function_extension(custom_function_path):
+			print(f"Skipping non-function extension YAML: {custom_function_path}")
+			continue
+		if is_excluded_function_extension(custom_function_path):
+			print(f"Skipping unsupported extension YAML: {custom_function_path}")
+			continue
+		# Each extension YAML declares its own Substrait URN
+		# (extension:<owner>:<id>); use it directly rather than reconstructing it
+		# from the file name.
+		urn, functions = parse_yaml(os.path.join(custom_extension_folder,custom_function_path))
 		for function in functions:
-			for impls_args in function["impls_args"]:
-				type_str = "{"
-				for args in impls_args: 
-					type_value = regex.sub(r'<[^>]*>', '', args["value"])
-					if (len(type_value) != 0):
+			for impl in function["impls"]:
+				types = []
+				for args in impl["args"]:
+					type_value = declared_type(args)
+					if type_value:
 						type_set.add(type_value)
-						type_str += f"\"{type_value}\","
-				# Remove trailing comma if present
-				if type_str.endswith(","):
-					type_str = type_str[:-1]
-				type_str += "}"
+						types.append(f"\"{type_value}\"")
+				type_str = "{" + ", ".join(types) + "}"
 				function_name = function["name"]
-				inner_code += f"\tInsertCustomFunction(\"{function_name}\", {type_str}, \"{custom_function_path}\");\n" 
+				if impl["is_variadic"]:
+					# `min` goes out verbatim, counting occurrences of the final (repeatable)
+					# argument rather than total arguments -- so concat_ws, declared with two
+					# arguments and `min: 1`, accepts two at the fewest. Converting that to a
+					# minimum call-site arity is left to the C++ side, which already has the
+					# declared arity in hand.
+					variadic_min = impl["variadic_min"]
+					inner_code += f"\tInsertVariadicCustomFunction(\"{function_name}\", {type_str}, \"{urn}\", {variadic_min});\n"
+				else:
+					inner_code += f"\tInsertCustomFunction(\"{function_name}\", {type_str}, \"{urn}\");\n"
 	print(type_set)
 	return inner_code
 
@@ -60,12 +213,12 @@ def write_custom_extension_file(custom_functions):
 	file_path  = os.path.join(os.path.dirname(os.path.realpath(__file__)),'..','src','custom_extensions_generated.cpp')
 	header = '''#include "custom_extensions/custom_extensions.hpp"
 
-//! This class is auto-generated by scripts/geenrate_extension_initializer.py
-//! It depends on substrait/extensions yaml files
-namespace duckdb{
+//! This class is auto-generated by scripts/generate_custom_functions.py
+//! It depends on the substrait-extensions extensions/*.yaml files
+namespace duckdb {
 
-void SubstraitCustomFunctions::Initialize(){
-	'''
+void SubstraitCustomFunctions::Initialize() {
+'''
 	footer = '''}
 
 } // namespace duckdb'''
@@ -77,5 +230,32 @@ void SubstraitCustomFunctions::Initialize(){
 		file.write(custom_functions)
 		file.write(footer)
 
-functions = get_custom_functions()
-write_custom_extension_file(functions)
+def resolve_extensions_folder():
+	"""Return the directory holding the Substrait extension YAML files.
+
+	If a path is passed on the command line (e.g. a local substrait-packaging
+	checkout's extensions dir, or a FetchContent-populated SubstraitExtensions
+	data dir), use it. Otherwise shallow-clone substrait-packaging at
+	SUBSTRAIT_EXTENSIONS_TAG and use its vendored extensions dir. The caller is
+	responsible for cleaning up the returned temp dir via the second return
+	value (None when a user-provided path is used).
+	"""
+	if len(sys.argv) > 1:
+		return sys.argv[1], None
+
+	tmp_dir = tempfile.mkdtemp(prefix="substrait-extensions-")
+	print(f"Cloning {SUBSTRAIT_PACKAGING_REPO} @ {SUBSTRAIT_EXTENSIONS_TAG}")
+	subprocess.run(
+		["git", "clone", "--depth", "1", "--branch", SUBSTRAIT_EXTENSIONS_TAG,
+		 SUBSTRAIT_PACKAGING_REPO, tmp_dir],
+		check=True,
+	)
+	return os.path.join(tmp_dir, SUBSTRAIT_EXTENSIONS_SUBDIR), tmp_dir
+
+extensions_folder, tmp_dir = resolve_extensions_folder()
+try:
+	functions = get_custom_functions(extensions_folder)
+	write_custom_extension_file(functions)
+finally:
+	if tmp_dir is not None:
+		shutil.rmtree(tmp_dir, ignore_errors=True)

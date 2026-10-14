@@ -34,6 +34,8 @@ struct ToSubstraitFunctionData : public TableFunctionData {
 	//! We will fail the conversion on possible warnings
 	bool strict = false;
 	bool finished = false;
+	//! Output column names from the planner
+	vector<string> plan_names;
 	//! Original options from the connection
 	ClientConfig original_config;
 	set<OptimizerType> original_disabled_optimizers;
@@ -58,6 +60,23 @@ struct ToSubstraitFunctionData : public TableFunctionData {
 		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
 		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
 		disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
+		// The CommonSubplan optimizer deduplicates repeated subplans into
+		// materialized CTEs, which cannot be expressed in Substrait.
+		disabled_optimizers.insert(OptimizerType::COMMON_SUBPLAN);
+		// STATISTICS_PROPAGATION must be disabled because it uses table
+		// statistics (cardinality, min/max) at plan-generation time to fold
+		// filters that look always-false against the current data — e.g. a
+		// query on an empty table folds into LogicalEmptyResult, and
+		// `WHERE id > 100` folds away when the current max id is 3. This
+		// produces a non-portable plan (virtualTable {}) that returns 0 rows
+		// regardless of runtime data. A Substrait plan must be valid for any
+		// data conforming to the schema.
+		disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
+		// EMPTY_RESULT_PULLUP is disabled as an additional safeguard: it
+		// propagates LogicalEmptyResult upward through joins/projections, so
+		// if any other pass introduces an empty-result node in the future,
+		// it won't cascade into a fully-folded plan.
+		disabled_optimizers.insert(OptimizerType::EMPTY_RESULT_PULLUP);
 		// If error(varchar) gets implemented in substrait this can be removed
 		DBConfig::GetConfig(context).SetOption(ScalarSubqueryErrorOnMultipleRowsSetting::Name, false);
 		DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
@@ -74,6 +93,7 @@ struct ToSubstraitFunctionData : public TableFunctionData {
 			planner.CreatePlan(std::move(parser.statements[0]));
 			D_ASSERT(planner.plan);
 
+			plan_names = planner.names;
 			plan = std::move(planner.plan);
 
 			if (context.config.enable_optimizer) {
@@ -81,6 +101,7 @@ struct ToSubstraitFunctionData : public TableFunctionData {
 				plan = optimizer.Optimize(std::move(plan));
 			}
 
+			plan->ResolveOperatorTypes();
 			ColumnBindingResolver resolver;
 			ColumnBindingResolver::Verify(*plan);
 			resolver.VisitOperator(*plan);
@@ -209,7 +230,7 @@ static void ToSubFunctionInternal(ClientContext &context, ToSubstraitFunctionDat
                                   unique_ptr<LogicalOperator> &query_plan, string &serialized) {
 	output.SetCardinality(1);
 	query_plan = data.ExtractPlan(context);
-	auto transformer_d2s = DuckDBToSubstrait(context, *query_plan, data.strict);
+	auto transformer_d2s = DuckDBToSubstrait(context, *query_plan, data.strict, data.plan_names);
 	serialized = transformer_d2s.SerializeToString();
 	output.SetValue(0, 0, Value::BLOB_RAW(serialized));
 }
@@ -218,8 +239,7 @@ static void ToJsonFunctionInternal(ClientContext &context, ToSubstraitFunctionDa
                                    unique_ptr<LogicalOperator> &query_plan, string &serialized) {
 	output.SetCardinality(1);
 	query_plan = data.ExtractPlan(context);
-	auto transformer_d2s = DuckDBToSubstrait(context, *query_plan, data.strict);
-	;
+	auto transformer_d2s = DuckDBToSubstrait(context, *query_plan, data.strict, data.plan_names);
 	serialized = transformer_d2s.SerializeToJson();
 	output.SetValue(0, 0, serialized);
 }

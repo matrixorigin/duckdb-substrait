@@ -100,6 +100,7 @@ private:
 	shared_ptr<Relation> TransformOp(const substrait::Rel &sop,
 	                                 const google::protobuf::RepeatedPtrField<std::string> *names = nullptr);
 	shared_ptr<Relation> TransformJoinOp(const substrait::Rel &sop);
+	shared_ptr<Relation> TransformLateralJoinOp(const substrait::Rel &sop);
 	shared_ptr<Relation> TransformCrossProductOp(const substrait::Rel &sop);
 	shared_ptr<Relation> TransformFetchOp(const substrait::Rel &sop,
 	                                      const google::protobuf::RepeatedPtrField<std::string> *names = nullptr);
@@ -123,16 +124,28 @@ private:
 	unique_ptr<ParsedExpression> TransformExpr(const substrait::Expression &sexpr,
 	                                           RootNameIterator *iterator = nullptr);
 	unique_ptr<ParsedExpression> TransformLiteralExpr(const substrait::Expression &sexpr);
-	static unique_ptr<ParsedExpression> TransformSelectionExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformSelectionExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> ResolveOuterReference(
+	    const substrait::Expression_FieldReference_OuterReference &outer_ref, int32_t field_idx);
+	static JoinType TransformJoinType(substrait::JoinRel::JoinType stype, bool lateral_only);
 	unique_ptr<ParsedExpression> TransformScalarFunctionExpr(const substrait::Expression &sexpr);
 	unique_ptr<ParsedExpression> TransformIfThenExpr(const substrait::Expression &sexpr);
 	unique_ptr<ParsedExpression> TransformCastExpr(const substrait::Expression &sexpr);
 	unique_ptr<ParsedExpression> TransformInExpr(const substrait::Expression &sexpr);
+	unique_ptr<ParsedExpression> TransformSubqueryExpr(const substrait::Expression &sexpr);
+	//! Wraps a Substrait Rel as the SELECT statement of a DuckDB subquery expression
+	unique_ptr<SelectStatement> SubqueryStatement(const substrait::Rel &rel);
+	static ExpressionType TransformSetComparisonOp(
+	    substrait::Expression_Subquery_SetComparison::ComparisonOp op);
 	unique_ptr<ParsedExpression> TransformNested(const substrait::Expression &sexpr,
 	                                             RootNameIterator *iterator = nullptr);
 
 	static void VerifyCorrectExtractSubfield(const string &subfield);
 	static string RemapFunctionName(const string &function_name);
+	//! Folds an aggregate's variant selector -- carried either as a leading enumeration
+	//! argument or as a `distribution` function option -- into the DuckDB function name.
+	static string RemapEnumAggregate(const string &function_name, const vector<string> &enum_args,
+	                                 const google::protobuf::RepeatedPtrField<substrait::FunctionOption> &options);
 	static string RemoveExtension(const string &function_name);
 	LogicalType SubstraitToDuckType(const substrait::Type &s_type);
 	SubstraitExtensionIdentity ExtensionIdentity(uint32_t anchor, bool type) const;
@@ -153,6 +166,14 @@ private:
 	shared_ptr<SubstraitExtensionHandler> extension_handler;
 	unordered_map<uint32_t, SubstraitExtensionIdentity> extension_types;
 	unordered_map<uint32_t, SubstraitExtensionIdentity> extension_functions;
+	//! Tracks the left side's column names for each currently-enclosing LateralJoinRel,
+	//! keyed by that LateralJoinRel's RelCommon.rel_anchor. Used to resolve OuterReference
+	//! field references into a name-based ColumnRefExpression against the "left" alias.
+	struct LateralScope {
+		uint32_t rel_anchor;
+		vector<string> left_column_names;
+	};
+	vector<LateralScope> lateral_scopes;
 	//! Remapped functions with differing names to the correct DuckDB functions
 	//! names
 	static const unordered_map<std::string, std::string> function_names_remap;

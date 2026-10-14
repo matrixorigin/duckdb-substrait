@@ -1,0 +1,64 @@
+# name: test/sql/test_schema_mismatch_crash.test
+# description: Test that schema mismatch in project emit mapping raises an error instead of crashing (issue #190)
+# group: [sql]
+
+require substrait
+
+statement ok
+CREATE TABLE orders (order_id INTEGER, customer_id INTEGER, order_date VARCHAR, total DOUBLE);
+
+statement ok
+INSERT INTO orders VALUES (1, 100, '2024-01-01', 99.99), (2, 101, '2024-01-02', 149.50);
+
+# Reject the missing baseSchema columns before applying the project's emit mapping.
+# The plan declares 10 columns, but the table has only 4.
+statement error
+CALL from_substrait_json('{
+  "relations": [{
+    "root": {
+      "input": {
+        "project": {
+          "common": {
+            "emit": {
+              "outputMapping": [10]
+            }
+          },
+          "input": {
+            "read": {
+              "common": {"direct": {}},
+              "baseSchema": {
+                "names": ["order_id", "customer_id", "order_date", "total", "col5", "col6", "col7", "col8", "col9", "col10"],
+                "struct": {
+                  "types": [
+                    {"i32": {"nullability": "NULLABILITY_REQUIRED"}},
+                    {"i32": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"fp64": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}},
+                    {"string": {"nullability": "NULLABILITY_NULLABLE"}}
+                  ],
+                  "nullability": "NULLABILITY_REQUIRED"
+                }
+              },
+              "namedTable": {"names": ["orders"]}
+            }
+          },
+          "expressions": [{
+            "selection": {
+              "directReference": {"structField": {"field": 3}},
+              "rootReference": {}
+            }
+          }]
+        }
+      },
+      "names": ["total"]
+    }
+  }],
+  "version": {"minorNumber": 85}
+}')
+----
+baseSchema column 'col5' not found
